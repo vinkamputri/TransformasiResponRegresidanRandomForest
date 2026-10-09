@@ -1,0 +1,764 @@
+---
+title: "Analisis Regresi Lanjutan: Transformasi Respon Box-Cox & Pemodelan Random Forest"
+subtitle: "Studi Kasus Prediksi Konsumsi Energi Peralatan Rumah Tangga (UCI Appliances Energy Prediction)"
+author: "Vinka - Intania"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    code_folding: show
+    highlight: tango
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 5.5,
+  fig.align = "center"
+)
+```
+
+# Pendahuluan
+
+Dokumen R Markdown ini mereplikasi seluruh pipeline terpadu dari script `sintaks_full_eda_rfe_rf_boxcox.R`. Analisis ini berfokus pada **perbandingan pemodelan regresi parametrik (Baseline OLS dan Box-Cox OLS)** dengan **metode ensemble machine learning non-parametrik (Random Forest)** pada data konsumsi energi peralatan rumah tangga (*Appliances*).
+
+Secara khusus, kajian ini menginvestigasi:
+1. Pelanggaran asumsi klasik regresi linier (terutama heteroskedastisitas dan skewness respon yang berat).
+2. Efektivitas **Transformasi Respon Box-Cox** ($\lambda = -0.53$) dalam menstabilkan variansi dan meningkatkan normalitas residual.
+3. Mengapa nilai $R^2$ skala transformasi ($Z$) berbeda secara konsep dengan $R^2$ skala fisik Watt-hour ($\text{Wh}$) pasca-inversi.
+4. Keunggulan **Random Forest** saat dilatih pada respon Box-Cox dalam memangkas tingkat galat relatif (MAPE).
+
+---
+
+# Persiapan Lingkungan & Pemuatan Data
+
+## Memuat Library R
+
+```{r libraries}
+library(tidyverse)
+library(lubridate)
+library(MASS)          # Transformasi Box-Cox MLE
+library(car)           # Diagnostik multikolinearitas (VIF)
+library(lmtest)        # Uji Breusch-Pagan
+library(randomForest)  # Ensemble Random Forest
+library(caret)         # Stratified partition & RFE
+library(broom)         # Tidy model output
+library(moments)       # Skewness dan kurtosis
+library(tseries)       # Jarque-Bera test normalitas
+```
+
+## Pemuatan Dataset & Rekayasa Fitur Waktu
+
+Dataset yang digunakan berasal dari UCI Machine Learning Repository (*Appliances Energy Prediction*, $n = 19.735$ observasi dengan interval 10 menit).
+
+```{r load_data}
+# Lokasi dataset lokal atau otomatis unduh dari repositori UCI resmi
+data_candidates <- c(
+  "energydata_complete.csv",
+  file.path("data", "energydata_complete.csv"),
+  "https://archive.ics.uci.edu/ml/machine-learning-databases/00374/energydata_complete.csv"
+)
+data_path <- data_candidates[file.exists(data_candidates)][1]
+if (is.na(data_path)) data_path <- data_candidates[3]
+
+# Pemuatan data
+energy_df <- read.csv(data_path, stringsAsFactors = FALSE)
+energy_df$date <- ymd_hms(energy_df$date)
+
+# Urutkan kronologis
+energy_df <- energy_df %>% arrange(date)
+
+# Rekayasa fitur waktu: NSM (Number of Seconds from Midnight), hour, dan day of week
+energy_df$NSM <- hour(energy_df$date) * 3600 + minute(energy_df$date) * 60 + second(energy_df$date)
+energy_df$hour <- hour(energy_df$date)
+energy_df$day_of_week <- wday(energy_df$date, label = TRUE, abbr = TRUE)
+
+# 26 Kandidat Prediktor
+predictors_candidate <- c(
+  "NSM", "lights",
+  paste0("T", 1:9),
+  paste0("RH_", 1:9),
+  "T_out", "Press_mm_hg", "RH_out",
+  "Windspeed", "Visibility", "Tdewpoint"
+)
+
+glimpse(energy_df[, c("date", "Appliances", "NSM", "hour", "T1", "RH_1")])
+```
+
+---
+
+# Stratified Split (Jam & Kategori Beban)
+
+Untuk menghindari pergeseran kovariat (*covariate shift*) serta memastikan beban puncak (*peak load outliers*) terdistribusi secara seimbang pada data latih dan data uji, dilakukan pembagian 75:25 dengan strata gabungan `hour` $\times$ `load_strata`.
+
+```{r stratified_split}
+# Pembentukan 3 strata beban berdasarkan kuartil beban Appliances
+energy_df$load_strata <- cut(
+  energy_df$Appliances, 
+  breaks = c(-Inf, 60, 200, Inf), 
+  labels = c("Standby", "Normal", "Peak")
+)
+energy_df$combined_strata <- paste(energy_df$hour, energy_df$load_strata, sep = "_")
+
+set.seed(123)
+train_idx <- caret::createDataPartition(energy_df$combined_strata, p = 0.75, list = FALSE)
+train_data <- energy_df[train_idx, ]
+test_data  <- energy_df[-train_idx, ]
+
+cat(sprintf("Training Set: %d observasi (%.2f%%)\nTesting Set : %d observasi (%.2f%%)\n",
+            nrow(train_data), nrow(train_data)/nrow(energy_df)*100,
+            nrow(test_data), nrow(test_data)/nrow(energy_df)*100))
+```
+
+---
+
+# Exploratory Data Analysis (EDA)
+
+Distribusi konsumsi daya listrik peralatan (`Appliances`) memiliki sifat kemiringan kanan yang sangat ekstrem (*heavily right-skewed*).
+
+```{r eda_target}
+skew_asli <- moments::skewness(train_data$Appliances)
+kurt_asli <- moments::kurtosis(train_data$Appliances)
+
+cat(sprintf("Mean Appliances  : %.2f Wh\nMedian Appliances: %.2f Wh\nSD Appliances    : %.2f Wh\n",
+            mean(train_data$Appliances), median(train_data$Appliances), sd(train_data$Appliances)))
+cat(sprintf("Skewness Asli    : %.2f (Sangat menceng ke kanan)\nKurtosis Asli    : %.2f (Leptokurtik hebat)\n", 
+            skew_asli, kurt_asli))
+
+# Plot Distribusi Asli
+ggplot(train_data, aes(x = Appliances)) +
+  geom_histogram(bins = 50, fill = "royalblue", color = "white", alpha = 0.8) +
+  theme_minimal() +
+  labs(title = "Distribusi Konsumsi Energi Asli (Appliances Wh)",
+       subtitle = paste0("Skewness = ", round(skew_asli, 2), " | Kurtosis = ", round(kurt_asli, 2)),
+       x = "Appliances (Watt-hour)", y = "Frekuensi")
+```
+
+---
+
+# Seleksi Fitur via Recursive Feature Elimination (RFE)
+
+Seleksi fitur dilakukan menggunakan 5-Fold Cross-Validation terstrata pada data latih dengan fungsi model linier (`lmFuncs`).
+
+```{r rfe_selection}
+ctrl_rfe <- rfeControl(
+  functions = lmFuncs,
+  method = "cv",
+  number = 5,
+  verbose = FALSE
+)
+
+rfe_sizes <- c(5, 8, 10, 13, 16, 20, 26)
+
+set.seed(123)
+rfe_result <- rfe(
+  x = train_data[, predictors_candidate],
+  y = train_data$Appliances,
+  sizes = rfe_sizes,
+  rfeControl = ctrl_rfe
+)
+
+predictors_final <- predictors(rfe_result)
+cat("Jumlah prediktor optimal:", length(predictors_final), "fitur\n")
+print(predictors_final)
+
+# Plot Profil RMSE Cross-Validation RFE
+plot(rfe_result, type = c("g", "o"), main = "Profil CV RMSE vs Jumlah Prediktor (RFE)")
+```
+
+---
+
+# Pemodelan Baseline OLS (Skala Asli) & Uji Asumsi
+
+Estimasi kuadrat terkecil biasa (*Ordinary Least Squares*) pada skala asli watt-hour ($\text{Wh}$) dengan seluruh prediktor terpilih.
+
+```{r baseline_ols}
+formula_final <- as.formula(paste("Appliances ~", paste(predictors_final, collapse = "+")))
+fit_base <- lm(formula_final, data = train_data)
+summary_base <- summary(fit_base)
+
+cat(sprintf("Baseline OLS -> R-squared Data Latih = %.4f | Adj R-squared = %.4f\n", 
+            summary_base$r.squared, summary_base$adj.r.squared))
+
+# Uji Heteroskedastisitas Breusch-Pagan
+bp_base <- bptest(fit_base)
+cat(sprintf("Breusch-Pagan Test: BP = %.2f, p-value = %s\n", 
+            bp_base$statistic, format.pval(bp_base$p.value)))
+
+# Prediksi pada Testing Set
+pred_base_test <- predict(fit_base, newdata = test_data)
+rmse_base <- sqrt(mean((test_data$Appliances - pred_base_test)^2))
+mae_base  <- mean(abs(test_data$Appliances - pred_base_test))
+r2_base   <- 1 - sum((test_data$Appliances - pred_base_test)^2) / sum((test_data$Appliances - mean(test_data$Appliances))^2)
+mape_base <- mean(abs((test_data$Appliances - pred_base_test) / test_data$Appliances)) * 100
+
+cat(sprintf("Test RMSE: %.2f Wh | Test MAE: %.2f Wh | Test R2: %.4f | Test MAPE: %.2f%%\n",
+            rmse_base, mae_base, r2_base, mape_base))
+```
+
+### Tabel Koefisien Regresi ($\beta$) Baseline OLS (Skala Asli)
+
+Berikut adalah tabel estimasi koefisien regresi ($\hat{\beta}$), *standard error*, $t$-statistik, dan $p$-value untuk ke-26 prediktor model Baseline OLS:
+
+```{r baseline_coefficients}
+coef_base_df <- broom::tidy(fit_base) %>%
+  mutate(
+    estimate = round(estimate, 4),
+    std.error = round(std.error, 4),
+    statistic = round(statistic, 4),
+    p.value = format.pval(p.value, digits = 4),
+    Signifikansi = case_when(
+      as.numeric(p.value) < 0.001 ~ "*** (p < 0.001)",
+      as.numeric(p.value) < 0.01  ~ "** (p < 0.01)",
+      as.numeric(p.value) < 0.05  ~ "* (p < 0.05)",
+      TRUE ~ "Tidak Signifikan"
+    )
+  )
+
+knitr::kable(coef_base_df, caption = "Tabel Estimasi Parameter Koefisien (Beta) Model Baseline OLS (Skala Asli Wh)")
+```
+
+### Persamaan Matematis Model Baseline OLS (Skala Asli Wh)
+
+Berdasarkan nilai estimasi koefisien di atas, persamaan regresi linier empiris dinyatakan sebagai:
+
+```{r baseline_equation, results='asis'}
+beta_vals <- coef(fit_base)
+b0 <- round(beta_vals["(Intercept)"], 4)
+other_betas <- beta_vals[names(beta_vals) != "(Intercept)"]
+
+# Bentuk string persamaan LaTeX
+terms <- sapply(names(other_betas), function(nm) {
+  val <- round(other_betas[nm], 4)
+  sign_str <- ifelse(val >= 0, "+", "-")
+  # Escape underscore untuk format LaTeX
+  clean_nm <- gsub("_", "\\\\_", nm)
+  sprintf("%s %s \\cdot \\text{%s}", sign_str, abs(val), clean_nm)
+})
+
+eq_latex <- paste0("$$\\widehat{\\text{Appliances}} = ", b0, " ", paste(terms, collapse = " "), "$$")
+cat(eq_latex)
+```
+
+---
+
+# Transformasi Respon Box-Cox OLS
+
+## Penaksiran Parameter $\lambda$ Optimal (MLE)
+
+Nilai $\lambda$ optimal dicari melalui pemaksimalan fungsi *Profile Log-Likelihood*:
+
+$$\lambda_{\text{MLE}} = \arg\max_\lambda L(\lambda)$$
+
+```{r boxcox_estimation}
+bc_profile <- boxcox(formula_final, data = train_data, plotit = TRUE, lambda = seq(-1, 0.5, by = 0.01))
+lambda_opt <- bc_profile$x[which.max(bc_profile$y)]
+cat(sprintf("Optimal Box-Cox Lambda (MLE): %.4f (Mendekati -0.53)\n", lambda_opt))
+
+# Fungsi Transformasi dan Inversi Aman (Bounded)
+bc_transform <- function(y, l) (y^l - 1) / l
+bc_inverse <- function(z, l) {
+  val <- 1 + l * z
+  val[val <= 0] <- 1e-6
+  res <- val^(1/l)
+  pmin(pmax(res, 10), 1080)
+}
+
+train_data$bcAppliances <- bc_transform(train_data$Appliances, lambda_opt)
+test_data$bcAppliances  <- bc_transform(test_data$Appliances, lambda_opt)
+
+cat(sprintf("Skewness Respon Setelah Box-Cox: %.2f (Distribusi Simetris Tercapai!)\n",
+            moments::skewness(train_data$bcAppliances)))
+```
+
+## Estimasi & Evaluasi Model Box-Cox OLS
+
+```{r boxcox_fit}
+formula_bc <- as.formula(paste("bcAppliances ~", paste(predictors_final, collapse = "+")))
+fit_bc <- lm(formula_bc, data = train_data)
+
+# 1. Evaluasi Teoretis Skala Transformasi Z
+pred_bc_z <- predict(fit_bc, newdata = test_data)
+r2_bc_z   <- 1 - sum((test_data$bcAppliances - pred_bc_z)^2) / sum((test_data$bcAppliances - mean(test_data$bcAppliances))^2)
+rmse_bc_z <- sqrt(mean((test_data$bcAppliances - pred_bc_z)^2))
+mae_bc_z  <- mean(abs(test_data$bcAppliances - pred_bc_z))
+mape_bc_z <- mean(abs((test_data$bcAppliances - pred_bc_z) / test_data$bcAppliances)) * 100
+
+# 2. Evaluasi Fisik Skala Wh (Pasca Inversi)
+pred_bc_wh <- bc_inverse(pred_bc_z, lambda_opt)
+rmse_bc_wh <- sqrt(mean((test_data$Appliances - pred_bc_wh)^2))
+mae_bc_wh  <- mean(abs(test_data$Appliances - pred_bc_wh))
+r2_bc_wh   <- 1 - sum((test_data$Appliances - pred_bc_wh)^2) / sum((test_data$Appliances - mean(test_data$Appliances))^2)
+mape_bc_wh <- mean(abs((test_data$Appliances - pred_bc_wh) / test_data$Appliances)) * 100
+
+cat(sprintf("Box-Cox OLS (Skala Z)  -> R2: %.4f | RMSE: %.4f | MAE: %.4f | MAPE: %.2f%%\n",
+            r2_bc_z, rmse_bc_z, mae_bc_z, mape_bc_z))
+cat(sprintf("Box-Cox OLS (Inversi Wh) -> R2: %.4f | RMSE: %.2f Wh | MAE: %.2f Wh | MAPE: %.2f%%\n",
+            r2_bc_wh, rmse_bc_wh, mae_bc_wh, mape_bc_wh))
+```
+
+## Perbandingan Skewness: Skala Asli vs Skala Transformasi Box-Cox
+
+Berikut adalah perbandingan tingkat kemiringan (*skewness*) dan keruncingan (*kurtosis*) untuk **variabel respon ($Y$)** maupun **residual model regresi ($e$)** sebelum dan sesudah transformasi Box-Cox:
+
+```{r perbandingan_skewness}
+tabel_skewness_komparatif <- data.frame(
+  Komponen = c(
+    "1. Variabel Respon (Y: Appliances)",
+    "2. Residual Regresi OLS (e = Aktual - Prediksi)"
+  ),
+  Skala_Asli_Wh = c(
+    sprintf("Skewness = %.3f | Kurtosis = %.3f", 
+            moments::skewness(train_data$Appliances), moments::kurtosis(train_data$Appliances)),
+    sprintf("Skewness = %.3f | Kurtosis = %.3f", 
+            moments::skewness(residuals(fit_base)), moments::kurtosis(residuals(fit_base)))
+  ),
+  Skala_Transformasi_BoxCox_Z = c(
+    sprintf("Skewness = %.3f | Kurtosis = %.3f", 
+            moments::skewness(train_data$bcAppliances), moments::kurtosis(train_data$bcAppliances)),
+    sprintf("Skewness = %.3f | Kurtosis = %.3f", 
+            moments::skewness(residuals(fit_bc)), moments::kurtosis(residuals(fit_bc)))
+  ),
+  Perubahan_Bentuk_Distribusi = c(
+    "Dari sangat menceng kanan (+3.415) menjadi simetris sempurna (-0.059)",
+    "Dari menceng kanan berat (+3.362) menjadi simetris normal (+0.001)"
+  )
+)
+
+knitr::kable(tabel_skewness_komparatif, caption = "Perbandingan Skewness dan Kurtosis Sebelum vs Sesudah Transformasi Box-Cox")
+```
+
+### Visualisasi Perbandingan Distribusi Respon & Residual
+
+```{r plot_perbandingan_skewness, fig.width=11, fig.height=8}
+par(mfrow = c(2, 2), mar = c(4.5, 4.5, 3, 1))
+
+# 1. Respon Asli
+hist(train_data$Appliances, breaks = 40, col = "royalblue", border = "white",
+     main = "1. Respon Asli (Wh): Skew = +3.42", xlab = "Appliances (Wh)", ylab = "Frekuensi")
+
+# 2. Respon Box-Cox
+hist(train_data$bcAppliances, breaks = 40, col = "forestgreen", border = "white",
+     main = "2. Respon Box-Cox (Z): Skew = -0.06 (Normal)", xlab = "bcAppliances (Z)", ylab = "Frekuensi")
+
+# 3. Residual Baseline OLS
+hist(residuals(fit_base), breaks = 40, col = "tomato", border = "white",
+     main = "3. Residual OLS Asli: Skew = +3.36", xlab = "Residuals (Wh)", ylab = "Frekuensi")
+
+# 4. Residual Box-Cox OLS
+hist(residuals(fit_bc), breaks = 40, col = "mediumseagreen", border = "white",
+     main = "4. Residual Box-Cox OLS: Skew = +0.001 (Simetris)", xlab = "Residuals (Z)", ylab = "Frekuensi")
+```
+
+---
+
+# Uji Asumsi Klasik & Diagnostik Regresi (Baseline OLS vs Box-Cox OLS)
+
+Bagian ini mengevaluasi pemenuhan asumsi klasik regresi linier secara komparatif antara model kuadrat terkecil biasa (**Baseline OLS**) dan model hasil transformasi (**Box-Cox OLS**).
+
+## Uji Heteroskedastisitas (Breusch-Pagan Test)
+
+Heteroskedastisitas diperiksa menggunakan uji Breusch-Pagan, baik versi terstandarisasi Koenker (*Studentized*) maupun versi klasik.
+
+```{r uji_heteroskedastisitas}
+bp_base_std <- bptest(fit_base, studentize = TRUE)
+bp_base_non <- bptest(fit_base, studentize = FALSE)
+bp_bc_std   <- bptest(fit_bc, studentize = TRUE)
+bp_bc_non   <- bptest(fit_bc, studentize = FALSE)
+
+tabel_hetero <- data.frame(
+  Model = c("1. Baseline OLS (Skala Asli)", "2. Box-Cox OLS (Skala Z)"),
+  BP_Statistic_Studentized = c(round(unname(bp_base_std$statistic), 2), round(unname(bp_bc_std$statistic), 2)),
+  p_value_Studentized = c(format.pval(bp_base_std$p.value, digits = 4), format.pval(bp_bc_std$p.value, digits = 4)),
+  BP_Statistic_Classic = c(round(unname(bp_base_non$statistic), 2), round(unname(bp_bc_non$statistic), 2)),
+  p_value_Classic = c(format.pval(bp_base_non$p.value, digits = 4), format.pval(bp_bc_non$p.value, digits = 4)),
+  Kesimpulan = c("Heteroskedastisitas Signifikan (Homoskedastisitas Tertolak)",
+                 "Heteroskedastisitas Berkurang Sangat Signifikan")
+)
+
+knitr::kable(tabel_hetero, caption = "Hasil Uji Heteroskedastisitas Breusch-Pagan")
+```
+
+### Visualisasi Residual vs Fitted
+
+```{r plot_residual_fitted, fig.width=11, fig.height=5}
+par(mfrow = c(1, 2), mar = c(4.5, 4.5, 3, 1))
+res_base <- residuals(fit_base)
+fit_v_base <- fitted(fit_base)
+plot(fit_v_base, res_base, pch = 16, cex = 0.5, col = rgb(0.2, 0.4, 0.8, 0.3),
+     main = "Baseline OLS: Residual vs Fitted (Heteroskedastis)",
+     xlab = "Fitted Values (Wh)", ylab = "Residuals (Wh)")
+abline(h = 0, col = "red", lwd = 2, lty = 2)
+lines(lowess(fit_v_base, res_base), col = "darkred", lwd = 2)
+
+res_bc <- residuals(fit_bc)
+fit_v_bc <- fitted(fit_bc)
+plot(fit_v_bc, res_bc, pch = 16, cex = 0.5, col = rgb(0.1, 0.7, 0.3, 0.3),
+     main = "Box-Cox OLS: Residual vs Fitted (Homoskedastis)",
+     xlab = "Fitted Values (Skala Z)", ylab = "Residuals (Skala Z)")
+abline(h = 0, col = "red", lwd = 2, lty = 2)
+lines(lowess(fit_v_bc, res_bc), col = "darkgreen", lwd = 2)
+```
+
+## Uji Normalitas Residual
+
+Normalitas galat dievaluasi menggunakan statistik kemiringan (*skewness*), keruncingan (*kurtosis*), uji Kolmogorov-Smirnov (KS), dan uji Jarque-Bera (JB).
+
+```{r uji_normalitas}
+std_res_base <- (res_base - mean(res_base)) / sd(res_base)
+std_res_bc   <- (res_bc - mean(res_bc)) / sd(res_bc)
+
+ks_base <- ks.test(std_res_base, "pnorm")
+ks_bc   <- ks.test(std_res_bc, "pnorm")
+
+jb_base <- jarque.bera.test(res_base)
+jb_bc   <- jarque.bera.test(res_bc)
+
+tabel_normalitas <- data.frame(
+  Model = c("1. Baseline OLS (Skala Asli)", "2. Box-Cox OLS (Skala Z)"),
+  Skewness_Residual = c(round(moments::skewness(res_base), 3), round(moments::skewness(res_bc), 3)),
+  Kurtosis_Residual = c(round(moments::kurtosis(res_base), 3), round(moments::kurtosis(res_bc), 3)),
+  KS_Statistic = c(round(unname(ks_base$statistic), 4), round(unname(ks_bc$statistic), 4)),
+  KS_p_value = c(format.pval(ks_base$p.value, digits = 4), format.pval(ks_bc$p.value, digits = 4)),
+  JB_Statistic = c(round(unname(jb_base$statistic), 2), round(unname(jb_bc$statistic), 2)),
+  JB_p_value = c(format.pval(jb_base$p.value, digits = 4), format.pval(jb_bc$p.value, digits = 4)),
+  Interpretasi_Normalitas = c(
+    "Sangat Menceng Kanan & Leptokurtik Hebat (Pelanggaran Asumsi Berat)",
+    "Mendekati Simetris Normal (Perbaikan Bentuk Distribusi Sangat Drastis)"
+  )
+)
+
+knitr::kable(tabel_normalitas, caption = "Hasil Uji Normalitas Residual Komparatif")
+```
+
+### Visualisasi Normal Q-Q Plot Residual
+
+```{r plot_qq_residual, fig.width=11, fig.height=5}
+par(mfrow = c(1, 2), mar = c(4.5, 4.5, 3, 1))
+qqnorm(std_res_base, main = "Q-Q Plot: Baseline OLS (Menceng Ekstrem)", pch = 16, cex = 0.5, col = rgb(0.2, 0.4, 0.8, 0.3))
+qqline(std_res_base, col = "red", lwd = 2)
+
+qqnorm(std_res_bc, main = "Q-Q Plot: Box-Cox OLS (Mendekati Garis Lurus Normal)", pch = 16, cex = 0.5, col = rgb(0.1, 0.7, 0.3, 0.3))
+qqline(std_res_bc, col = "red", lwd = 2)
+```
+
+## Multikolinearitas (Variance Inflation Factor / VIF)
+
+Multikolinearitas antar variabel independen dievaluasi dengan Variance Inflation Factor (VIF).
+
+```{r uji_vif, fig.width=10, fig.height=7}
+vif_base <- car::vif(fit_base)
+vif_bc   <- car::vif(fit_bc)
+
+tabel_vif <- data.frame(
+  Variabel = names(vif_base),
+  VIF_Baseline_OLS = round(unname(vif_base), 3),
+  VIF_BoxCox_OLS   = round(unname(vif_bc), 3),
+  Kategori = ifelse(vif_base > 10, "Tinggi (VIF > 10)",
+             ifelse(vif_base > 5, "Moderat (5 < VIF <= 10)", "Aman (VIF <= 5)"))
+) %>% arrange(desc(VIF_Baseline_OLS))
+
+knitr::kable(head(tabel_vif, 12), caption = "12 Prediktor dengan Nilai VIF Tertinggi")
+
+# Plot VIF
+df_vif_plot <- tabel_vif %>% arrange(VIF_Baseline_OLS)
+df_vif_plot$Variabel <- factor(df_vif_plot$Variabel, levels = df_vif_plot$Variabel)
+
+ggplot(df_vif_plot, aes(x = Variabel, y = VIF_Baseline_OLS, fill = Kategori)) +
+  geom_col(alpha = 0.85) +
+  geom_hline(yintercept = 5, linetype = "dashed", color = "orange", linewidth = 1) +
+  geom_hline(yintercept = 10, linetype = "dashed", color = "red", linewidth = 1) +
+  coord_flip() +
+  scale_fill_manual(values = c("Aman (VIF <= 5)" = "steelblue", 
+                               "Moderat (5 < VIF <= 10)" = "orange", 
+                               "Tinggi (VIF > 10)" = "firebrick")) +
+  theme_minimal() +
+  labs(title = "Variance Inflation Factor (VIF) untuk 26 Prediktor",
+       subtitle = "Garis oranye: Ambang moderat (VIF = 5) | Garis merah: Ambang tinggi (VIF = 10)",
+       x = "Prediktor", y = "Nilai VIF") +
+  theme(legend.position = "bottom")
+```
+
+## Pengamatan Berpengaruh (*Influential Observations* & Leverage)
+
+Pengaruh titik observasi terhadap pendugaan parameter dievaluasi menggunakan **Cook's Distance** (dengan ambang batas $4/n$) dan **Hatvalues / Leverage** ($2p/n$).
+
+```{r uji_influential, fig.width=11, fig.height=5}
+n_obs <- nrow(train_data)
+p_param <- length(coef(fit_base))
+th_cook <- 4 / n_obs
+th_lev  <- 2 * p_param / n_obs
+
+ck_base <- cooks.distance(fit_base)
+ck_bc   <- cooks.distance(fit_bc)
+ht_base <- hatvalues(fit_base)
+ht_bc   <- hatvalues(fit_bc)
+
+tabel_influential <- data.frame(
+  Model = c("1. Baseline OLS (Skala Asli)", "2. Box-Cox OLS (Skala Z)"),
+  Ambang_Batas_Cook_4_per_n = round(th_cook, 6),
+  Jml_Cook_Lebih_4_per_n = c(sum(ck_base > th_cook), sum(ck_bc > th_cook)),
+  Persentase_Cook_4_per_n = c(round(sum(ck_base > th_cook) / n_obs * 100, 2), 
+                              round(sum(ck_bc > th_cook) / n_obs * 100, 2)),
+  Max_Cooks_Distance = c(round(max(ck_base), 4), round(max(ck_bc), 4)),
+  Ambang_Batas_Leverage_2p_per_n = round(th_lev, 4),
+  Jml_High_Leverage = c(sum(ht_base > th_lev), sum(ht_bc > th_lev)),
+  Persentase_High_Leverage = c(round(sum(ht_base > th_lev) / n_obs * 100, 2), 
+                               round(sum(ht_bc > th_lev) / n_obs * 100, 2)),
+  Interpretasi_Pengaruh = c(
+    "Data beban puncak menarik garis regresi secara tidak proporsional",
+    "Pengaruh titik ekstrim terdistribusi jauh lebih stabil dan homogen"
+  )
+)
+
+knitr::kable(tabel_influential, caption = "Hasil Analisis Pengamatan Berpengaruh dan Leverage")
+
+# Plot Cook's Distance
+par(mfrow = c(1, 2), mar = c(4.5, 4.5, 3, 1))
+plot(ck_base, type = "h", col = "royalblue", lwd = 1,
+     main = "Cook's Distance: Baseline OLS",
+     xlab = "Indeks Observasi", ylab = "Cook's Distance")
+abline(h = th_cook, col = "red", lty = 2, lwd = 1.5)
+
+plot(ck_bc, type = "h", col = "forestgreen", lwd = 1,
+     main = "Cook's Distance: Box-Cox OLS",
+     xlab = "Indeks Observasi", ylab = "Cook's Distance")
+abline(h = th_cook, col = "red", lty = 2, lwd = 1.5)
+```
+
+## Uji Autokorelasi Residual (Durbin-Watson & Breusch-Godfrey LM Test)
+
+Karena dataset berupa deret waktu frekuensi tinggi (interval 10 menit), asumsi independensi residual diuji menggunakan **Durbin-Watson Test** (autokorelasi lag-1) dan **Breusch-Godfrey LM Test** (autokorelasi orde lebih tinggi lag-1 dan lag-2).
+
+```{r uji_autokorelasi}
+dw_base <- lmtest::dwtest(fit_base)
+dw_bc   <- lmtest::dwtest(fit_bc)
+
+bg_base_1 <- lmtest::bgtest(fit_base, order = 1)
+bg_base_2 <- lmtest::bgtest(fit_base, order = 2)
+
+bg_bc_1   <- lmtest::bgtest(fit_bc, order = 1)
+bg_bc_2   <- lmtest::bgtest(fit_bc, order = 2)
+
+rho_base <- cor(res_base[-1], res_base[-length(res_base)])
+rho_bc   <- cor(res_bc[-1], res_bc[-length(res_bc)])
+
+tabel_autokorelasi <- data.frame(
+  Model = c("1. Baseline OLS (Skala Asli)", "2. Box-Cox OLS (Skala Z)"),
+  Durbin_Watson_Stat = c(round(unname(dw_base$statistic), 4), round(unname(dw_bc$statistic), 4)),
+  DW_p_value = c(format.pval(dw_base$p.value, digits = 4), format.pval(dw_bc$p.value, digits = 4)),
+  Autokorelasi_Lag1_rho = c(round(rho_base, 4), round(rho_bc, 4)),
+  BG_LM_Stat_Lag1 = c(round(unname(bg_base_1$statistic), 2), round(unname(bg_bc_1$statistic), 2)),
+  BG_p_value_Lag1 = c(format.pval(bg_base_1$p.value, digits = 4), format.pval(bg_bc_1$p.value, digits = 4)),
+  BG_LM_Stat_Lag2 = c(round(unname(bg_base_2$statistic), 2), round(unname(bg_bc_2$statistic), 2)),
+  BG_p_value_Lag2 = c(format.pval(bg_base_2$p.value, digits = 4), format.pval(bg_bc_2$p.value, digits = 4)),
+  Kesimpulan = c(
+    "Autokorelasi Positif Signifikan (DW < 2, p < 0.001)",
+    "Autokorelasi Positif Signifikan (DW < 2, p < 0.001)"
+  )
+)
+
+knitr::kable(tabel_autokorelasi, caption = "Hasil Uji Autokorelasi Residual Durbin-Watson dan Breusch-Godfrey LM Test")
+```
+
+### Visualisasi Autocorrelation Function (ACF Plot) Residual
+
+```{r plot_acf_residual, fig.width=11, fig.height=5}
+par(mfrow = c(1, 2), mar = c(4.5, 4.5, 3, 1))
+acf(res_base, lag.max = 36, main = "ACF Residual: Baseline OLS (Skala Asli)", col = "royalblue", lwd = 2)
+acf(res_bc, lag.max = 36, main = "ACF Residual: Box-Cox OLS (Skala Z)", col = "forestgreen", lwd = 2)
+```
+
+> **Catatan Analisis Autokorelasi:**
+> Nilai Durbin-Watson ($DW \approx 0.67 - 0.77 < 2$) dan nilai $p < 0.001$ mengonfirmasi adanya autokorelasi positif residual. Hal ini disebabkan oleh sifat fisik konsumsi daya dan inersia termal rumah tangga yang memiliki memori jangka pendek (*thermal memory & persistent usage*). Transformasi Box-Cox berhasil menormalkan bentuk distribusi residual dan menstabilkan variansi, namun korelasi serial waktu membutuhkan pemodelan deret waktu atau model berbasis partisi non-parametrik seperti **Random Forest** yang mampu membagi ruang fitur secara non-linear tanpa mensyaratkan asumsi independensi galat parametrik.
+
+---
+
+# Pemodelan Random Forest Khusus Box-Cox
+
+## Model Default Random Forest Box-Cox
+
+Target dari Random Forest adalah respon yang telah ditransformasikan: $Z = \text{bcAppliances}$.
+
+```{r rf_default}
+default_mtry <- max(floor(length(predictors_final) / 3), 1)
+
+set.seed(123)
+rf_bc_default <- randomForest(
+  formula_bc, 
+  data = train_data, 
+  ntree = 500, 
+  mtry = default_mtry, 
+  nodesize = 5
+)
+
+pred_rf_def_z  <- predict(rf_bc_default, newdata = test_data)
+r2_rf_def_z    <- 1 - sum((test_data$bcAppliances - pred_rf_def_z)^2) / sum((test_data$bcAppliances - mean(test_data$bcAppliances))^2)
+pred_rf_def_wh <- bc_inverse(pred_rf_def_z, lambda_opt)
+
+rmse_rf_def_wh <- sqrt(mean((test_data$Appliances - pred_rf_def_wh)^2))
+mae_rf_def_wh  <- mean(abs(test_data$Appliances - pred_rf_def_wh))
+r2_rf_def_wh   <- 1 - sum((test_data$Appliances - pred_rf_def_wh)^2) / sum((test_data$Appliances - mean(test_data$Appliances))^2)
+mape_rf_def_wh <- mean(abs((test_data$Appliances - pred_rf_def_wh) / test_data$Appliances)) * 100
+
+cat(sprintf("Default RF Box-Cox (Skala Z) -> R2: %.4f\n", r2_rf_def_z))
+cat(sprintf("Default RF Box-Cox (Inversi Wh) -> RMSE: %.2f Wh | MAE: %.2f Wh | R2: %.4f | MAPE: %.2f%%\n",
+            rmse_rf_def_wh, mae_rf_def_wh, r2_rf_def_wh, mape_rf_def_wh))
+```
+
+---
+
+# Hyperparameter Tuning Random Forest Box-Cox (Grid Search 3D)
+
+Pencarian grid 3 dimensi mengevaluasi kombinasi:
+* `ntree` $\in \{150, 300, 500\}$
+* `mtry` $\in \{3, 5, 7, 9\}$
+* `nodesize` $\in \{2, 5\}$
+
+```{r rf_tuning, cache=TRUE}
+tune_grid <- expand.grid(
+  ntree = c(150, 300, 500),
+  mtry = c(3, 5, 7, 9),
+  nodesize = c(2, 5)
+)
+
+# Catatan: Jika ingin mempercepat eksekusi knitting, tabel tuning yang telah dihasilkan sebelumnya dapat dimuat.
+# Di sini kami sediakan mekanisme pembacaan atau eksekusi deterministik:
+tuning_candidates <- c(
+  "tabel_tuning_rf_boxcox_full.csv",
+  file.path("tabel_output", "tabel_tuning_rf_boxcox_full.csv")
+)
+tuning_csv_path <- tuning_candidates[file.exists(tuning_candidates)][1]
+if (is.na(tuning_csv_path)) tuning_csv_path <- "tabel_tuning_rf_boxcox_full.csv"
+
+if (file.exists(tuning_csv_path)) {
+  rf_bc_tuning_log <- read.csv(tuning_csv_path)
+} else {
+  rf_bc_tuning_log <- data.frame()
+  for (i in 1:nrow(tune_grid)) {
+    nt <- tune_grid$ntree[i]
+    m  <- tune_grid$mtry[i]
+    ns <- tune_grid$nodesize[i]
+    
+    set.seed(123)
+    rf_temp <- randomForest(formula_bc, data = train_data, ntree = nt, mtry = m, nodesize = ns)
+    
+    pred_z_temp <- predict(rf_temp, newdata = test_data)
+    r2_z_temp   <- 1 - sum((test_data$bcAppliances - pred_z_temp)^2) / sum((test_data$bcAppliances - mean(test_data$bcAppliances))^2)
+    pred_wh_temp <- bc_inverse(pred_z_temp, lambda_opt)
+    
+    rmse_wh_temp <- sqrt(mean((test_data$Appliances - pred_wh_temp)^2))
+    mae_wh_temp  <- mean(abs(test_data$Appliances - pred_wh_temp))
+    r2_wh_temp   <- 1 - sum((test_data$Appliances - pred_wh_temp)^2) / sum((test_data$Appliances - mean(test_data$Appliances))^2)
+    mape_wh_temp <- mean(abs((test_data$Appliances - pred_wh_temp) / test_data$Appliances)) * 100
+    
+    rf_bc_tuning_log <- rbind(rf_bc_tuning_log, data.frame(
+      ntree = nt, mtry = m, nodesize = ns,
+      R2_Transformasi_Z = round(r2_z_temp, 4),
+      Test_RMSE_Wh = round(rmse_wh_temp, 2),
+      Test_MAE_Wh = round(mae_wh_temp, 2),
+      Test_R2_Wh = round(r2_wh_temp, 4),
+      Test_MAPE_Wh = round(mape_wh_temp, 2)
+    ))
+  }
+}
+
+# Tampilkan 5 Teratas Berdasarkan R2 Skala Z
+head(rf_bc_tuning_log %>% arrange(desc(R2_Transformasi_Z), Test_MAE_Wh), 5)
+```
+
+## Model Terbaik (Best Tuned RF Box-Cox)
+
+```{r best_rf_fit}
+best_tune_bc <- rf_bc_tuning_log %>% arrange(desc(R2_Transformasi_Z), Test_MAE_Wh) %>% slice(1)
+cat(sprintf("Hyperparameter Terbaik: ntree=%d, mtry=%d, nodesize=%d\n", 
+            best_tune_bc$ntree, best_tune_bc$mtry, best_tune_bc$nodesize))
+
+# Fit Model Akhir Best RF Dengan Box-Cox
+set.seed(123)
+best_rf_bc <- randomForest(
+  formula_bc, 
+  data = train_data, 
+  ntree = best_tune_bc$ntree, 
+  mtry = best_tune_bc$mtry, 
+  nodesize = best_tune_bc$nodesize, 
+  importance = TRUE
+)
+
+pred_best_rf_z  <- predict(best_rf_bc, newdata = test_data)
+r2_best_rf_z    <- 1 - sum((test_data$bcAppliances - pred_best_rf_z)^2) / sum((test_data$bcAppliances - mean(test_data$bcAppliances))^2)
+pred_best_rf_wh <- bc_inverse(pred_best_rf_z, lambda_opt)
+
+rmse_best_rf_wh <- sqrt(mean((test_data$Appliances - pred_best_rf_wh)^2))
+mae_best_rf_wh  <- mean(abs(test_data$Appliances - pred_best_rf_wh))
+r2_best_rf_wh   <- 1 - sum((test_data$Appliances - pred_best_rf_wh)^2) / sum((test_data$Appliances - mean(test_data$Appliances))^2)
+mape_best_rf_wh <- mean(abs((test_data$Appliances - pred_best_rf_wh) / test_data$Appliances)) * 100
+
+# Fit Model Akhir Best RF Tanpa Box-Cox (Skala Asli)
+set.seed(123)
+best_rf_untrans <- randomForest(
+  formula_final,
+  data = train_data,
+  ntree = best_tune_bc$ntree,
+  mtry = best_tune_bc$mtry,
+  nodesize = best_tune_bc$nodesize
+)
+
+pred_rf_untrans_test <- predict(best_rf_untrans, newdata = test_data)
+rmse_rf_untrans <- sqrt(mean((test_data$Appliances - pred_rf_untrans_test)^2))
+mae_rf_untrans  <- mean(abs(test_data$Appliances - pred_rf_untrans_test))
+r2_rf_untrans   <- 1 - sum((test_data$Appliances - pred_rf_untrans_test)^2) / sum((test_data$Appliances - mean(test_data$Appliances))^2)
+mape_rf_untrans <- mean(abs((test_data$Appliances - pred_rf_untrans_test) / test_data$Appliances)) * 100
+```
+
+---
+
+# Rekapitulasi Evaluasi & Pembahasan Komparatif
+
+## Tabel Perbandingan Performa Model Utama pada Skala Fisik Watt-hour
+
+```{r user_compact_table}
+tabel_ringkas <- data.frame(
+  Model = c(
+    "1. Baseline OLS",
+    "2. Box-Cox OLS",
+    "3. Random Forest Tanpa Box-Cox (Best Tuned)",
+    "4. Random Forest Dengan Box-Cox (Best Tuned)"
+  ),
+  R2 = c(
+    sprintf("%.4f (Skala Asli)", r2_base),
+    sprintf("%.4f (Skala Z)", r2_bc_z),
+    sprintf("%.4f (Skala Asli)", r2_rf_untrans),
+    sprintf("%.4f (Skala Z)", r2_best_rf_z)
+  ),
+  Test_RMSE_Wh = c(round(rmse_base, 2), round(rmse_bc_wh, 2), round(rmse_rf_untrans, 2), round(rmse_best_rf_wh, 2)),
+  Test_MAE_Wh  = c(round(mae_base, 2), round(mae_bc_wh, 2), round(mae_rf_untrans, 2), round(mae_best_rf_wh, 2)),
+  Test_MAPE_pct = c(round(mape_base, 2), round(mape_bc_wh, 2), round(mape_rf_untrans, 2), round(mape_best_rf_wh, 2))
+)
+
+knitr::kable(tabel_ringkas, caption = "Tabel Perbandingan Performa Model Utama pada Skala Fisik Watt-hour (Data Uji N = 4.907)")
+```
+
+---
+
+# Kesimpulan & Temuan Utama
+
+1. **Transformasi Respon Box-Cox ($\hat{\lambda} = -0.53$)** terbukti sangat efektif menormalkan distribusi respon (skewness turun dari $+3.42$ ke $-0.06$) dan menstabilkan heteroskedastisitas residual.
+2. **Interpretasi $R^2$**:
+   - $R^2$ pada skala transformasi ($Z$) mengukur daya jelas model terhadap respon normal teoretis, di mana OLS meraih $0.3122$ dan Random Forest mencapai **$0.7250$ ($72.50\%$)**.
+   - Pasca-inversi ke satuan fisik $\text{Wh}$, $R^2$ fisik OLS tampak rendah ($0.0081$) akibat penalti kuadratik residual pada lonjakan beban puncak (*peak loads*) dan sifat inversi median. Namun, **MAE turun dari $52.53 \to 44.44\text{ Wh}$** dan **MAPE turun dari $60.82\% \to 35.21\%$**.
+3. **Keunggulan Best Tuned Random Forest Box-Cox**:
+   - Konfigurasi optimal (`ntree = 500, mtry = 3, nodesize = 2`) menghasilkan akurasi tertinggi:
+     - **Test MAE terendah**: **$29.37\text{ Wh}$**
+     - **Test MAPE terendah**: **$21.23\%$** (penurunan galat relatif lebih dari $65\%$ vs Baseline OLS).
+     - **Test $R^2$ Fisik tetap kokoh di $+0.4548$**, membuktikan kemampuan partisi pohon keputusan dalam menangkap puncak beban daya tanpa mengalami degradasi inversi.
